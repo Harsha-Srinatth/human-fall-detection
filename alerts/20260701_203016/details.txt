@@ -1,0 +1,5 @@
+Time: 20:30:16
+Date: 01-07-2026
+Camera: 1
+Image: C:\Users\91738\OneDrive\Documents\Harsha_Project_Docs\Human-Fall-Detection\HUMAN-FALL_DETECTION\alerts\20260701_203016\snapshot.jpg
+Video: C:\Users\91738\OneDrive\Documents\Harsha_Project_Docs\Human-Fall-Detection\HUMAN-FALL_DETECTION\alerts\20260701_203016\clip.avi

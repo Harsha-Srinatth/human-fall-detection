@@ -1,4 +1,5 @@
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-mediapipe>=0.10.0
-numpy>=1.24.0
+fastapi==0.115.6
+uvicorn==0.32.1
+python-multipart==0.0.20
+opencv-python-headless==4.10.0.84
+numpy==2.1.3

@@ -33,17 +33,23 @@
   .alert img { width:100%; border-radius:6px; display:block; margin-top:6px; }
   .alert b { color:var(--bad); }
   .muted { color:var(--muted); font-size:13px; }
+  .rules { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:8px; margin-top:12px; }
+  .rule { background:#11141a; border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:13px; }
+  .rule b { display:block; font-size:15px; margin-top:2px; }
+  .rule.on b { color:var(--bad); }
+  details { margin-top:12px; font-size:13px; color:var(--muted); }
+  details li { margin:4px 0; }
   .banner { display:none; background:var(--bad); color:#fff; padding:10px 14px; border-radius:8px; margin-bottom:12px; font-weight:600; }
 </style>
 </head>
 <body>
 <header>
   <h1>Human Fall Detection</h1>
-  <p>Detects a person lying still on the floor and alerts within 10 seconds, then sends a reminder every 2 minutes while the person is still down (no spam every frame). Use your webcam or upload a video.</p>
+  <p>Pose-based fall detection (YOLOv8-pose keypoints): torso angle, body shape and fall speed. Alerts 10 s after a fall with no movement, then reminds every 2 minutes while the person is still down. Use your webcam or upload a video.</p>
 </header>
 <main>
   <section class="card">
-    <div id="banner" class="banner">EMERGENCY: Person fallen. Alert sent - reminders every 2 min while still down.</div>
+    <div id="banner" class="banner">EMERGENCY: Person fallen and not getting up. Alert sent - reminders every 2 min while still down.</div>
     <div class="controls">
       <button id="camBtn">Start webcam</button>
       <label class="btn" for="file">Upload video</label>
@@ -59,10 +65,22 @@
       <span id="timer" class="muted"></span>
     </div>
     <div class="bar"><div id="bar"></div></div>
+    <div class="rules" id="rules"></div>
   </section>
   <aside class="card">
     <h2>Alerts</h2>
     <div id="alerts"><p class="muted">No alerts yet.</p></div>
+    <details>
+      <summary>How detection works</summary>
+      <ul>
+        <li><b>Lying</b> = torso angle &gt; 60&deg; from vertical AND (box wider than 1.2&times; height OR body spread horizontal).</li>
+        <li><b>Fall</b> = person was upright less than 1.5 s before lying, or hips dropped &ge; 40% of body height.</li>
+        <li>Fall + no movement for <b>10 s</b> &rarr; emergency alert.</li>
+        <li>On the floor <b>30 s</b> (even if moving) &rarr; alert ("can't get up").</li>
+        <li>Still down &rarr; reminder every <b>2 min</b>. Stand up for 3 s &rarr; reset.</li>
+        <li>Sitting close to the camera is not a fall (no torso tilt).</li>
+      </ul>
+    </details>
   </aside>
 </main>
 <script>
@@ -90,7 +108,7 @@ function stop() {
   video.pause(); video.removeAttribute('src'); video.srcObject = null; video.load();
   octx.clearRect(0, 0, overlay.width, overlay.height);
   stopBtn.disabled = true;
-  setStatus({ status: 'Idle', timer: 0, timeout: 1 });
+  setStatus({ status: 'Idle', on_floor: 0 });
 }
 
 async function startWith(setup) {
@@ -98,69 +116,122 @@ async function startWith(setup) {
   await resetSession();
   banner.style.display = 'none';
   try { await setup(); } catch (e) { alert('Could not start: ' + e.message); return; }
-  await video.play();
+  if (fileMode) video.pause(); else await video.play();
   running = true; stopBtn.disabled = false;
   loop();
 }
 
 camBtn.onclick = () => startWith(async () => {
   stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-  video.srcObject = stream;
+  video.srcObject = stream; fileMode = false;
 });
 document.getElementById('file').onchange = e => {
   const f = e.target.files[0]; if (!f) return;
-  startWith(async () => { video.src = URL.createObjectURL(f); video.loop = false; });
+  startWith(async () => {
+    video.src = URL.createObjectURL(f); video.loop = false; fileMode = true; endedAt = null;
+    await new Promise(r => { video.onloadeddata = r; });
+  });
   e.target.value = '';
 };
 stopBtn.onclick = stop;
-video.onended = () => { running = false; stopBtn.disabled = true; };
+
+const STEP = 0.2; // seconds of video between analysed frames
+let fileMode = false, endedAt = null, startWall = 0;
+
+function seek(t) {
+  return new Promise(r => { video.onseeked = () => r(); video.currentTime = t; });
+}
+
+async function sendFrame(ts) {
+  const w = 640, h = Math.round(640 * video.videoHeight / video.videoWidth);
+  grab.width = w; grab.height = h;
+  grab.getContext('2d').drawImage(video, 0, 0, w, h);
+  const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.75));
+  const fd = new FormData();
+  fd.append('frame', blob, 'f.jpg'); fd.append('session', session); fd.append('ts', ts.toFixed(3));
+  const res = await fetch('/api/frame', { method: 'POST', body: fd });
+  const s = await res.json();
+  if (!running) return;
+  draw(s, w, h); setStatus(s);
+  if (s.alert) { banner.style.display = 'block'; loadAlerts(); }
+}
 
 async function loop() {
+  startWall = performance.now() / 1000;
+  let t = 0;
   while (running) {
-    if (video.readyState >= 2 && video.videoWidth) {
-      const w = 640, h = Math.round(640 * video.videoHeight / video.videoWidth);
-      grab.width = w; grab.height = h;
-      grab.getContext('2d').drawImage(video, 0, 0, w, h);
-      const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.7));
-      const fd = new FormData(); fd.append('frame', blob, 'f.jpg'); fd.append('session', session);
-      try {
-        const res = await fetch('/api/frame', { method: 'POST', body: fd });
-        const s = await res.json();
-        if (!running) break;
-        draw(s, w, h); setStatus(s);
-        if (s.alert) { banner.style.display = 'block'; loadAlerts(); }
-      } catch (e) { statusEl.textContent = 'Server error'; }
-    }
-    await new Promise(r => setTimeout(r, 150));
+    try {
+      if (fileMode) {
+        // Step through the video in video-time so results don't depend on server speed.
+        // After the video ends we keep sending the last frame: "the person is still lying there".
+        if (endedAt === null && t <= video.duration) {
+          await seek(t);
+          await sendFrame(t);
+          t += STEP;
+          if (t > video.duration) endedAt = performance.now() / 1000;
+        } else {
+          await sendFrame(video.duration + (performance.now() / 1000 - endedAt));
+          await new Promise(r => setTimeout(r, 300));
+        }
+      } else if (video.readyState >= 2 && video.videoWidth) {
+        await sendFrame(performance.now() / 1000 - startWall);
+        await new Promise(r => setTimeout(r, 100));
+      } else {
+        await new Promise(r => setTimeout(r, 100));
+      }
+    } catch (e) { statusEl.textContent = 'Server error'; await new Promise(r => setTimeout(r, 1000)); }
   }
 }
 
+const SKELETON = [[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16],[0,5],[0,6]];
 function draw(s, w, h) {
   overlay.width = w; overlay.height = h;
   octx.clearRect(0, 0, w, h);
   octx.lineWidth = 3; octx.font = '16px system-ui';
-  for (const [x1, y1, x2, y2, c] of s.boxes) {
-    const fallen = (x2 - x1) > (y2 - y1);
-    octx.strokeStyle = octx.fillStyle = fallen ? '#ef4444' : '#22c55e';
+  const lying = s.posture && s.posture.lying;
+  for (const p of s.people) {
+    const [x1, y1, x2, y2] = p.box;
+    const color = s.alert_sent || lying ? '#ef4444' : '#22c55e';
+    octx.strokeStyle = octx.fillStyle = color;
     octx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    octx.fillText(`${fallen ? 'Fallen' : 'Person'} ${c}`, x1 + 4, Math.max(16, y1 - 6));
+    octx.fillText(`Person ${p.conf}`, x1 + 4, Math.max(16, y1 - 6));
+    for (const [a, b] of SKELETON) {
+      const ka = p.kpts[a], kb = p.kpts[b];
+      if (ka[2] > 0.35 && kb[2] > 0.35) { octx.beginPath(); octx.moveTo(ka[0], ka[1]); octx.lineTo(kb[0], kb[1]); octx.stroke(); }
+    }
+    for (const k of p.kpts) if (k[2] > 0.35) { octx.beginPath(); octx.arc(k[0], k[1], 3, 0, 7); octx.fill(); }
   }
 }
 
 function setStatus(s) {
   statusEl.textContent = s.status;
-  statusEl.className = 'pill ' + (s.alert_sent ? 'bad' : s.status === 'Possible fall' ? 'warn' : s.status === 'Standing' ? 'ok' : '');
-  timerEl.textContent = s.status === 'Possible fall' ? `Not moving: ${s.timer}s / ${s.timeout}s` : '';
-  barEl.style.width = (s.alert_sent ? 100 : 100 * s.timer / s.timeout) + '%';
+  const warn = ['Fall detected', 'Lying down', 'Possible fall'].includes(s.status);
+  statusEl.className = 'pill ' + (s.alert_sent ? 'bad' : warn ? 'warn' : s.status === 'Upright' ? 'ok' : '');
+  let pct = 0, txt = '';
+  if (s.on_floor > 0 && !s.alert_sent) {
+    if (s.fall_motion) { pct = s.still_for / s.still_alert_sec; txt = `No movement: ${s.still_for}s / ${s.still_alert_sec}s`; }
+    else { pct = s.on_floor / s.long_lie_sec; txt = `On floor: ${s.on_floor}s / ${s.long_lie_sec}s`; }
+    if (s.moving) txt += ' (moving)';
+  }
+  if (s.alert_sent) { pct = 1; txt = `On floor ${Math.round(s.on_floor)}s - alerts sent: ${s.alert_count}`; }
+  timerEl.textContent = txt;
+  barEl.style.width = Math.min(100, pct * 100) + '%';
   barEl.style.background = s.alert_sent ? '#ef4444' : '#f59e0b';
-  if (s.status === 'Standing') banner.style.display = 'none';
+  if (s.status === 'Upright') banner.style.display = 'none';
+  const p = s.posture || {}, v = p.votes || {};
+  const rule = (name, val, on) => `<div class="rule ${on ? 'on' : ''}">${name}<b>${val}</b></div>`;
+  document.getElementById('rules').innerHTML = s.posture === undefined ? '' :
+    rule('Torso angle', p.angle == null ? 'n/a' : p.angle + '°', v.torso_angle) +
+    rule('Box width/height', p.ratio == null ? 'n/a' : p.ratio, v.box_ratio) +
+    rule('Body horizontal', v.body_spread ? 'yes' : 'no', v.body_spread) +
+    rule('Fast fall motion', s.fall_motion ? 'yes' : 'no', s.fall_motion);
 }
 
 async function loadAlerts() {
   const list = await fetch('/api/alerts').then(r => r.json()).catch(() => []);
   const el = document.getElementById('alerts');
   if (!list.length) { el.innerHTML = '<p class="muted">No alerts yet.</p>'; return; }
-  el.innerHTML = list.map(a => `<div class="alert"><b>EMERGENCY</b> &middot; ${a.message}
+  el.innerHTML = list.map(a => `<div class="alert"><b>${a.reminder ? 'REMINDER' : 'EMERGENCY'}</b> &middot; ${a.message}
     <div class="muted">${a.date} ${a.time}</div><img src="${a.image}" alt="snapshot"></div>`).join('');
 }
 loadAlerts();

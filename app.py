@@ -17,7 +17,7 @@ from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from detector import PersonDetector
+from detector import SKELETON, PersonDetector
 from fall_monitor import FallMonitor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,19 +47,24 @@ def send_telegram(alert, image_path):
         print("Telegram send failed:", e)
 
 
-def save_alert(frame, detections, state):
+def save_alert(frame, people, state):
     now = datetime.now()
     alert_id = now.strftime("%Y%m%d_%H%M%S_%f")
-    for x1, y1, x2, y2, _ in detections:
+    for p in people:
+        x1, y1, x2, y2 = p["box"]
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        for a, b in SKELETON:
+            ka, kb = p["kpts"][a], p["kpts"][b]
+            if ka[2] > 0.35 and kb[2] > 0.35:
+                cv2.line(frame, (int(ka[0]), int(ka[1])), (int(kb[0]), int(kb[1])), (0, 0, 255), 2)
     image_path = os.path.join(ALERTS_DIR, f"{alert_id}.jpg")
     cv2.imwrite(image_path, frame)
     alert = {
         "id": alert_id,
         "time": now.strftime("%H:%M:%S"),
         "date": now.strftime("%d-%m-%Y"),
-        "message": ("Person fallen and not moving" if state["alert_count"] == 1
-                    else f"REMINDER #{state['alert_count'] - 1}: person still down for {state['down_for'] // 60} min {state['down_for'] % 60} s"),
+        "message": state["reason"],
+        "reminder": state["alert_count"] > 1,
         "image": f"/alerts/{alert_id}.jpg",
     }
     alerts.insert(0, alert)
@@ -70,19 +75,28 @@ def save_alert(frame, detections, state):
 
 
 @app.post("/api/frame")
-async def process_frame(frame: UploadFile, session: str = Form(...)):
+async def process_frame(frame: UploadFile, session: str = Form(...), ts: float | None = Form(None)):
+    """ts = client time in seconds (video time for uploaded videos), so timers don't depend on server speed."""
     data = np.frombuffer(await frame.read(), np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(400, "Invalid image")
 
-    detections = detector.detect(img)
+    people = detector.detect(img)
     with lock:
         monitor = monitors.setdefault(session[:64], FallMonitor())
-        state = monitor.update(img, detections)
-        alert = save_alert(img, detections, state) if state["new_alert"] else None
+        if ts is not None and monitor.last_ts is not None and ts < monitor.last_ts:
+            monitor.reset()  # time went backwards -> new video
+        if ts is not None:
+            monitor.last_ts = ts
+        state = monitor.update(people, now=ts)
+        alert = save_alert(img, people, state) if state["new_alert"] else None
 
-    state["boxes"] = [[x1, y1, x2, y2, round(c, 2)] for x1, y1, x2, y2, c in detections]
+    state["people"] = [
+        {"box": list(p["box"]), "conf": round(p["conf"], 2),
+         "kpts": [[round(float(x)), round(float(y)), round(float(c), 2)] for x, y, c in p["kpts"]]}
+        for p in people
+    ]
     state["alert"] = alert
     return state
 

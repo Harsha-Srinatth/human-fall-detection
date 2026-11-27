@@ -22,4 +22,4 @@ uvicorn app:app --reload
 Open http://localhost:8000
 
 ## Deploy
-Railway: uses `railway.json` / `Procfile` (start: `uvicorn app:app --host 0.0.0.0 --port $PORT`).
+Render (free): uses `render.yaml`. Railway: uses `railway.json`. Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`.

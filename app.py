@@ -39,7 +39,7 @@ def send_telegram(alert, image_path):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
-        text = f"EMERGENCY: Person fallen\nTime: {alert['time']}\nDate: {alert['date']}"
+        text = f"EMERGENCY: {alert['message']}\nTime: {alert['time']}\nDate: {alert['date']}"
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
         urllib.request.urlopen(url, data=data, timeout=10)
@@ -47,7 +47,7 @@ def send_telegram(alert, image_path):
         print("Telegram send failed:", e)
 
 
-def save_alert(frame, detections):
+def save_alert(frame, detections, state):
     now = datetime.now()
     alert_id = now.strftime("%Y%m%d_%H%M%S_%f")
     for x1, y1, x2, y2, _ in detections:
@@ -58,7 +58,8 @@ def save_alert(frame, detections):
         "id": alert_id,
         "time": now.strftime("%H:%M:%S"),
         "date": now.strftime("%d-%m-%Y"),
-        "message": "Person fallen and not moving",
+        "message": ("Person fallen and not moving" if state["alert_count"] == 1
+                    else f"REMINDER #{state['alert_count'] - 1}: person still down for {state['down_for'] // 60} min {state['down_for'] % 60} s"),
         "image": f"/alerts/{alert_id}.jpg",
     }
     alerts.insert(0, alert)
@@ -79,7 +80,7 @@ async def process_frame(frame: UploadFile, session: str = Form(...)):
     with lock:
         monitor = monitors.setdefault(session[:64], FallMonitor())
         state = monitor.update(img, detections)
-        alert = save_alert(img, detections) if state["new_alert"] else None
+        alert = save_alert(img, detections, state) if state["new_alert"] else None
 
     state["boxes"] = [[x1, y1, x2, y2, round(c, 2)] for x1, y1, x2, y2, c in detections]
     state["alert"] = alert

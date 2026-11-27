@@ -5,6 +5,9 @@ detection flickered for one frame or tiny motion was seen. A person lying on
 the floor for 30 min therefore got a new alert every ~20-30 seconds.
 
 Fix:
+  * First alert after EMERGENCY_TIMEOUT_SEC (10s) of lying still.
+  * While the person stays down, a follow-up reminder is sent every
+    REMIND_EVERY_SEC (2 min) - escalation, not spam every frame.
   * The "alert sent" flag is only cleared when the person is seen standing
     again for RECOVER_SEC seconds (or nobody is seen for a long time).
   * Short detection drop-outs (< GRACE_SEC) do not reset the timer.
@@ -18,6 +21,7 @@ import numpy as np
 
 EMERGENCY_TIMEOUT_SEC = float(os.getenv("EMERGENCY_TIMEOUT_SEC", "10"))  # lying still this long -> alert
 RECOVER_SEC = float(os.getenv("RECOVER_SEC", "3"))   # standing this long -> new fall can alert again
+REMIND_EVERY_SEC = float(os.getenv("REMIND_EVERY_SEC", "120"))  # still down -> reminder alert every 2 min
 GRACE_SEC = 3.0            # ignore short detection gaps
 NOBODY_RESET_SEC = 60.0    # nobody in view this long -> reset
 MOTION_THRESHOLD = 0.12    # mean pixel change (0-1) inside the box that counts as "moving"
@@ -38,6 +42,9 @@ class FallMonitor:
         self.last_person_seen = None
         self.upright_since = None
         self.alert_sent = False
+        self.last_alert_at = None
+        self.first_alert_at = None
+        self.alert_count = 0
         self.prev_roi = None
 
     def _moving(self, frame, box):
@@ -67,7 +74,14 @@ class FallMonitor:
                 self.still_since = now
             if not self.alert_sent and now - self.still_since >= EMERGENCY_TIMEOUT_SEC:
                 self.alert_sent = True
+                self.first_alert_at = now
+                self.alert_count = 0
                 new_alert = True
+            elif self.alert_sent and now - self.last_alert_at >= REMIND_EVERY_SEC:
+                new_alert = True  # still on the floor: escalate, but only every REMIND_EVERY_SEC
+            if new_alert:
+                self.last_alert_at = now
+                self.alert_count += 1
         elif detections:  # someone standing
             self.prev_roi = None
             self.upright_since = self.upright_since or now
@@ -96,4 +110,6 @@ class FallMonitor:
             "timeout": EMERGENCY_TIMEOUT_SEC,
             "alert_sent": self.alert_sent,
             "new_alert": new_alert,
+            "alert_count": self.alert_count,
+            "down_for": int(now - self.first_alert_at + EMERGENCY_TIMEOUT_SEC) if self.alert_sent else 0,
         }
